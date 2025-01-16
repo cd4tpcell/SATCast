@@ -45,9 +45,9 @@ model.load_state_dict(checkpoint['model_state_dict'])
 model.to(device)
 
 
-
-
-c12=np.load('sample.npy')
+npyfile = 'sample.npy'
+if not osp.exists(npyfile): os.system(f'wget {home}/{npyfile}')
+c12=np.load(npyfile)
 
 c12=c12.astype(float).reshape(1,16,14,160,256)
 print(c12.shape)

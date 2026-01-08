@@ -16,11 +16,26 @@ from einops import rearrange
 
 from torchvision import datasets, transforms
 
+import os
+
+import glob
+
+
+# mini=np.load('mnist_test_seq.npy')
+
+
+import random
+
 
 
 def exists(x):
     return x is not None
 
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
 
 
 
@@ -57,8 +72,53 @@ class SinusoidalPositionEmbeddings(nn.Module):
     
 
 
+class Block(nn.Module):
+    def __init__(self, dim, dim_out, groups = 8):
+        super().__init__()
+        self.proj = nn.Conv2d(dim, dim_out, 3, padding = 1)
+        self.norm = nn.GroupNorm(groups, dim_out)
+        self.act = nn.SiLU()
+
+    def forward(self, x, scale_shift = None):
+        x = self.proj(x)
+        x = self.norm(x)
+
+        if exists(scale_shift):
+            scale, shift = scale_shift
+            x = x * (scale + 1) + shift
+
+        x = self.act(x)
+        return x
 
 
+
+
+
+class ResnetBlock(nn.Module):
+
+    def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8):
+        super().__init__()
+        self.mlp = (
+            nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, dim_out))
+            if exists(time_emb_dim)
+            else None
+        )
+
+        self.block1 = Block(dim, dim_out, groups=groups)
+        self.block2 = Block(dim_out, dim_out, groups=groups)
+        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+
+    def forward(self, x, time_emb=None):
+        h = self.block1(x)
+
+        if exists(self.mlp) and exists(time_emb):
+            time_emb = self.mlp(time_emb)
+            h = rearrange(time_emb, "b c -> b c 1 1") + h
+
+        h = self.block2(h)
+        return h + self.res_conv(x)
+
+# 定义之前提到的ConvNeXt网络
 class ConvNextBlock(nn.Module):
 
     def __init__(self, dim, dim_out, *, time_emb_dim=None, mult=2, norm=True):
@@ -79,7 +139,7 @@ class ConvNextBlock(nn.Module):
             nn.Conv2d(dim_out * mult, dim_out, 3, padding=1),
         )
 
-        self.ff_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb=None):
         h = self.ds_conv(x)
@@ -89,7 +149,7 @@ class ConvNextBlock(nn.Module):
             h = h + rearrange(condition, "b c -> b c 1 1")
 
         h = self.net(h)
-        return h + self.ff_conv(x)
+        return h + self.res_conv(x)
 
 
 
@@ -163,18 +223,32 @@ class Unet(nn.Module):
         self,
         dim,
         init_dim=None,
+        out_dim=None,
         dim_mults=(1, 2, 4, 8),
+        channels=None,
         with_time_emb=True,
+        resnet_block_groups=8,
+        use_convnext=True,
         convnext_mult=2,
         ini_core=7,
     ):
         super().__init__()
+
+        # determine dimensions
+        self.channels = channels
+
         init_dim =dim 
         self.init_conv = nn.Conv2d(14*12, init_dim, ini_core, padding=ini_core//2)
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
+        
         in_out = list(zip(dims[:-1], dims[1:]))
-        block_klass = partial(ConvNextBlock, mult=convnext_mult)
+
+        if use_convnext:
+            block_klass = partial(ConvNextBlock, mult=convnext_mult)
+        else:
+            block_klass = partial(ResnetBlock, groups=resnet_block_groups)
+
 
         if with_time_emb:
             time_dim = dim * 4
@@ -188,6 +262,7 @@ class Unet(nn.Module):
             time_dim = None
             self.time_mlp = None
 
+        # layers
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
         num_resolutions = len(in_out)
@@ -198,8 +273,8 @@ class Unet(nn.Module):
             self.downs.append(
                 nn.ModuleList(
                     [
-                        ConvNextBlock(dim_in, dim_out, time_emb_dim=time_dim,mult=convnext_mult),
-                        ConvNextBlock(dim_out, dim_out, time_emb_dim=time_dim,mult=convnext_mult),
+                        block_klass(dim_in, dim_out, time_emb_dim=time_dim),
+                        block_klass(dim_out, dim_out, time_emb_dim=time_dim),
                         Residual(PreNorm(dim_out, LinearAttention(dim_out))),
                         Downsample(dim_out) if not is_last else nn.Identity(),
                     ]
@@ -207,9 +282,9 @@ class Unet(nn.Module):
             )
 
         mid_dim = dims[-1]
-        self.mid_block1 = ConvNextBlock(mid_dim, mid_dim, time_emb_dim=time_dim,mult=convnext_mult)
+        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
         self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
-        self.mid_block2 = ConvNextBlock(mid_dim, mid_dim, time_emb_dim=time_dim,mult=convnext_mult)
+        self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
             is_last = ind >= (num_resolutions - 1)
@@ -217,15 +292,15 @@ class Unet(nn.Module):
             self.ups.append(
                 nn.ModuleList(
                     [
-                        ConvNextBlock(dim_out * 2, dim_in, time_emb_dim=time_dim,mult=convnext_mult),
-                        ConvNextBlock(dim_in, dim_in, time_emb_dim=time_dim,mult=convnext_mult),
+                        block_klass(dim_out * 2, dim_in, time_emb_dim=time_dim),
+                        block_klass(dim_in, dim_in, time_emb_dim=time_dim),
                         Residual(PreNorm(dim_in, LinearAttention(dim_in))),
                         Upsample(dim_in) if not is_last else nn.Identity(),
                     ]
                 )
             )
 
-
+        out_dim = default(out_dim, channels)
         self.final_conv = nn.Sequential(
             block_klass(dim, dim), nn.Conv2d(dim,192, 1), nn.Conv2d(192, 14*12, 1)
         )

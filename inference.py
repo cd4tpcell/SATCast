@@ -27,7 +27,9 @@ channels = 6
 
 model = Unet(
         dim=image_size,
+        channels=channels,
         dim_mults=(1, 2, 4,8),
+        out_dim=12,
         ini_core=7,
     )
 
@@ -214,3 +216,4 @@ for batch in dataloader:
 np.save("c12seqphase1.npy",future_data_baocun)
 
 exit()
+
